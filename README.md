@@ -1,6 +1,6 @@
 # CouchDB SQL
 
-A SQL-like command-line interface for CouchDB operations.
+A SQL-like command-line interface for CouchDB operations. Version **0.2.0**. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Overview
 
@@ -54,12 +54,13 @@ Start the interactive shell:
 
 ```bash
 python main.py
+python main.py --version
 ```
 
 You'll see the prompt:
 
 ```
-CouchDB SQL Interface
+CouchDB SQL Interface 0.2.0
 Type SQL-like commands or 'help' for assistance.
 Type 'quit' or 'exit' to leave.
 
