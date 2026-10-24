@@ -286,7 +286,7 @@ class TestNullAndBooleanComparisons:
         assert doc1["status"] == "active"
         assert all(doc.get("note") is None for doc in databases["shop"] if doc["_id"] != "1")
 
-    def test_mixed_types_still_raise(self):
+    def test_mixed_types_do_not_match_and_warn(self):
         executor, _db = make_executor()
-        with pytest.raises(TypeError):
-            executor.execute(parse("SELECT _id FROM shop WHERE n > '5';"))
+        assert matched_ids(executor, "SELECT _id FROM shop WHERE n > '5';") == []
+        assert executor.type_warnings

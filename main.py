@@ -51,8 +51,7 @@ Commands can span multiple lines. End with ; to execute.
 
         # Test connection on startup
         if not self.executor.test_connection():
-            print("Warning: Could not connect to CouchDB. Check your .env configuration.")
-            print(f"  URL: {self.executor.url}")
+            print(f"Warning: {self.executor.connection_message}")
             print()
 
     def precmd(self, line: str) -> str:
@@ -123,6 +122,7 @@ Commands can span multiple lines. End with ; to execute.
                 print(f"Inserted: {result['inserted']} document(s)")
                 if result.get('errors', 0) > 0:
                     print(f"Errors: {result['errors']}")
+                    self._print_error_details(result)
                 if result.get('ids') and len(result['ids']) <= 10:
                     print(f"IDs: {', '.join(result['ids'])}")
                 elif result.get('ids'):
@@ -156,6 +156,10 @@ Commands can span multiple lines. End with ; to execute.
                     print(f"Fields: {result['fields']}")
                 if result.get('errors', 0) > 0:
                     print(f"Errors: {result['errors']}")
+                    self._print_error_details(result)
+
+            for warning in self.executor.type_warnings:
+                print(f"Warning: {warning}")
 
         except ParseError as e:
             print(f"Parse error: {e}")
@@ -202,11 +206,16 @@ Commands can span multiple lines. End with ; to execute.
             print(f"\nImported: {import_result['inserted']} document(s)")
             if import_result.get('errors', 0) > 0:
                 print(f"Errors: {import_result['errors']}")
+                self._print_error_details(import_result)
 
         except ExecutorError as e:
             print(f"Import error: {e}")
         except Exception as e:
             print(f"Error: {e}")
+
+    def _print_error_details(self, result):
+        for detail in result.get('error_details') or []:
+            print(f"  {detail.get('id')}: {detail.get('error')}: {detail.get('reason')}")
 
     def do_quit(self, arg):
         """Exit the program."""

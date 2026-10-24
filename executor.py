@@ -3,9 +3,12 @@ CouchDB executor for SQL-like commands.
 Handles connection and operations against CouchDB.
 """
 
+import copy
 import os
 import re
 import json
+from pathlib import Path
+
 import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
@@ -18,6 +21,94 @@ from parser import (DeleteCommand, UpdateCommand, ExportCommand, SelectCommand, 
 
 class ExecutorError(Exception):
     pass
+
+
+# .env lives next to this file, not in the process's current directory.
+_ENV_FILE = Path(__file__).resolve().parent / '.env'
+
+_ILLEGAL_XLSX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
+def _parse_timeout(raw):
+    """Return a (connect, read) timeout pair. Default is 3s connect, 60s read."""
+    text = (raw or '').strip()
+    if not text:
+        return (3.0, 60.0)
+    parts = [part.strip() for part in text.split(',')]
+    try:
+        if len(parts) == 1:
+            seconds = float(parts[0])
+            return (seconds, seconds)
+        return (float(parts[0]), float(parts[1]))
+    except ValueError:
+        return (3.0, 60.0)
+
+
+def _quote_sql_ident(name) -> str:
+    """Quote a SQL identifier and double embedded quotes."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _parse_csv_number(text):
+    """Parse a _NUM cell. Leading zeros stay text. Integral scientific notation becomes int."""
+    number = float(text)
+    integer_part = text.split('e', 1)[0].split('E', 1)[0].split('.', 1)[0].lstrip('+-')
+    if len(integer_part) > 1 and integer_part.startswith('0'):
+        return text
+    if 'e' in text.lower() and number.is_integer():
+        return int(number)
+    if '.' in text or 'e' in text.lower():
+        return number
+    return int(number)
+
+
+def _parse_csv_bool(text):
+    lowered = text.lower()
+    if lowered == 'true':
+        return True
+    if lowered == 'false':
+        return False
+    return None
+
+
+def _excel_cell(value):
+    """Drop characters Excel rejects and keep formula-like text as text."""
+    if not isinstance(value, str):
+        return value
+    value = _ILLEGAL_XLSX.sub('', value)
+    if value[:1] in '=+-@':
+        return "'" + value
+    return value
+
+
+def _bulk_outcome(results):
+    """Split a _bulk_docs response into successes and id/error/reason rows."""
+    ok_rows = [row for row in results if row.get('ok')]
+    error_details = [
+        {'id': row.get('id'), 'error': row.get('error'), 'reason': row.get('reason')}
+        for row in results if 'error' in row
+    ]
+    return ok_rows, error_details
+
+
+class _SortValue:
+    """Comparable sort key. DESC uses real ordering, and mixed types do not raise."""
+
+    def __init__(self, value, reverse):
+        self.value = value
+        self.reverse = reverse
+
+    def __lt__(self, other):
+        try:
+            if self.reverse:
+                return self.value > other.value
+            return self.value < other.value
+        except TypeError:
+            left = (type(self.value).__name__, str(self.value))
+            right = (type(other.value).__name__, str(other.value))
+            if self.reverse:
+                return left > right
+            return left < right
 
 
 def _values_equal(actual, expected) -> bool:
@@ -48,11 +139,16 @@ def _same_order_kind(actual, expected) -> bool:
 
 class CouchDBExecutor:
     def __init__(self):
-        load_dotenv()
+        load_dotenv(_ENV_FILE)
 
         self.url = os.getenv('COUCHDB_URL', 'http://localhost:5984')
         self.user = os.getenv('COUCHDB_USER')
         self.password = os.getenv('COUCHDB_PASS')
+        self._timeout = _parse_timeout(os.getenv('COUCHDB_TIMEOUT'))
+        self._all_docs_page_size = 200
+        self.type_warnings = []
+        self.connection_message = ''
+        self._regex_cache = {}
 
         # Remove trailing slash from URL if present
         self.url = self.url.rstrip('/')
@@ -66,16 +162,135 @@ class CouchDBExecutor:
         url = f"{self.url}/{path}"
         kwargs['auth'] = self.auth
         kwargs.setdefault('headers', {})['Content-Type'] = 'application/json'
+        kwargs.setdefault('timeout', self._timeout)
 
         response = requests.request(method, url, **kwargs)
         return response
 
     def test_connection(self) -> bool:
-        """Test connection to CouchDB."""
+        """Check an authenticated CouchDB route.
+
+        GET / is public on a default server, so a 200 there does not mean
+        the configured user can work. HTTP 401 is reported as an auth
+        failure, not as a dead connection.
+        """
+        self.connection_message = ''
         try:
-            response = self._request('GET', '')
-            return response.status_code == 200
-        except requests.RequestException:
+            response = self._request('GET', '_all_dbs')
+        except requests.RequestException as exc:
+            self.connection_message = f"Could not connect to CouchDB at {self.url}: {exc}"
+            return False
+        if response.status_code == 200:
+            return True
+        reason = response.text
+        try:
+            body = response.json()
+            if isinstance(body, dict) and body.get('reason'):
+                reason = body['reason']
+        except ValueError:
+            pass
+        if response.status_code == 401:
+            self.connection_message = (
+                f"CouchDB authentication failed (HTTP 401) at {self.url}: {reason}"
+            )
+        else:
+            self.connection_message = (
+                f"CouchDB connection check failed (HTTP {response.status_code}) "
+                f"at {self.url}: {reason}"
+            )
+        return False
+
+    def _note_incompatible_types(self):
+        message = "Skipped comparisons between incompatible value types"
+        if message not in self.type_warnings:
+            self.type_warnings.append(message)
+
+    def _compiled_regex(self, pattern, flags):
+        if not isinstance(pattern, str):
+            raise ExecutorError(f"Invalid regular expression {pattern!r}: pattern must be a string")
+        key = (pattern, flags)
+        compiled = self._regex_cache.get(key)
+        if compiled is None:
+            try:
+                compiled = re.compile(pattern, flags)
+            except re.error as exc:
+                raise ExecutorError(f"Invalid regular expression {pattern!r}: {exc}") from exc
+            self._regex_cache[key] = compiled
+        return compiled
+
+    def _fetch_all_docs(self, database: str) -> list:
+        """Read every row of _all_docs, following startkey pages.
+
+        Raises ExecutorError when the server reports total_rows that this
+        client did not actually receive, so DELETE/UPDATE cannot apply to
+        a silent prefix of the database.
+        """
+        page_size = self._all_docs_page_size
+        documents = []
+        seen = 0
+        startkey = None
+        total = None
+        while True:
+            params = {'include_docs': 'true', 'limit': page_size}
+            if startkey is not None:
+                params['startkey'] = json.dumps(startkey)
+                params['skip'] = 1
+            response = self._request('GET', f'{database}/_all_docs', params=params)
+            if response.status_code != 200:
+                raise ExecutorError(f"Error fetching documents: {response.text}")
+            body = response.json()
+            if total is None:
+                total = body.get('total_rows')
+            rows = body.get('rows', [])
+            if not rows:
+                break
+            for row in rows:
+                seen += 1
+                doc = row.get('doc')
+                if isinstance(doc, dict):
+                    documents.append(doc)
+            if len(rows) < page_size:
+                break
+            next_key = rows[-1].get('key', rows[-1].get('id'))
+            if next_key is None or next_key == startkey:
+                break
+            startkey = next_key
+        if total is not None and seen != total:
+            raise ExecutorError(
+                f"Incomplete document read of '{database}': fetched {seen} of {total} rows"
+            )
+        return documents
+
+    def _assign_field(self, doc: dict, field: str, value):
+        """Set a top-level or dotted field. Refuse to clobber a non-object parent."""
+        if '.' not in field:
+            doc[field] = value
+            return
+        current = doc
+        parts = field.split('.')
+        for part in parts[:-1]:
+            existing = current.get(part) if isinstance(current, dict) else None
+            if existing is None:
+                existing = {}
+                current[part] = existing
+            elif not isinstance(existing, dict):
+                raise ExecutorError(f"Cannot set '{field}': '{part}' is not an object")
+            current = existing
+        current[parts[-1]] = value
+
+    def _ordered(self, actual, expected, op: str) -> bool:
+        if not _same_order_kind(actual, expected):
+            return False
+        try:
+            if op == '<':
+                return actual < expected
+            if op == '>':
+                return actual > expected
+            if op == '<=':
+                return actual <= expected
+            return actual >= expected
+        except TypeError:
+            self._note_incompatible_types()
             return False
 
     def _get_field_value(self, doc: dict, field: str):
@@ -124,9 +339,7 @@ class CouchDBExecutor:
         # Handle BETWEEN
         elif operator == 'BETWEEN':
             low, high = expected
-            if not _same_order_kind(actual, low) or not _same_order_kind(actual, high):
-                return False
-            return low <= actual <= high
+            return self._ordered(actual, low, '>=') and self._ordered(actual, high, '<=')
 
         # Handle comparison operators
         elif operator == '=':
@@ -134,37 +347,23 @@ class CouchDBExecutor:
         elif operator == '!=':
             return not _values_equal(actual, expected)
         elif operator == '<':
-            if not _same_order_kind(actual, expected):
-                return False
-            return actual < expected
+            return self._ordered(actual, expected, '<')
         elif operator == '>':
-            if not _same_order_kind(actual, expected):
-                return False
-            return actual > expected
+            return self._ordered(actual, expected, '>')
         elif operator == '<=':
-            if not _same_order_kind(actual, expected):
-                return False
-            return actual <= expected
+            return self._ordered(actual, expected, '<=')
         elif operator == '>=':
-            if not _same_order_kind(actual, expected):
-                return False
-            return actual >= expected
+            return self._ordered(actual, expected, '>=')
 
         # Handle regex operators
         elif operator == '~':
-            if actual is None or not isinstance(actual, str):
+            if not isinstance(actual, str):
                 return False
-            try:
-                return bool(re.search(expected, actual))
-            except re.error:
-                return False
+            return bool(self._compiled_regex(expected, 0).search(actual))
         elif operator == '~*':
-            if actual is None or not isinstance(actual, str):
+            if not isinstance(actual, str):
                 return False
-            try:
-                return bool(re.search(expected, actual, re.IGNORECASE))
-            except re.error:
-                return False
+            return bool(self._compiled_regex(expected, re.IGNORECASE).search(actual))
 
         return False
 
@@ -215,20 +414,13 @@ class CouchDBExecutor:
         elif db_response.status_code != 200:
             raise ExecutorError(f"Error accessing database: {db_response.text}")
 
-        # Fetch all documents
-        all_docs_response = self._request('GET', f'{database}/_all_docs', params={'include_docs': 'true'})
-        if all_docs_response.status_code != 200:
-            raise ExecutorError(f"Error fetching documents: {all_docs_response.text}")
-
-        all_docs = all_docs_response.json()
-        rows = all_docs.get('rows', [])
+        docs = self._fetch_all_docs(database)
 
         # Filter documents matching conditions
         to_delete = []
         scanned = 0
 
-        for row in rows:
-            doc = row.get('doc', {})
+        for doc in docs:
 
             # Skip design documents
             if doc.get('_id', '').startswith('_design/'):
@@ -248,7 +440,8 @@ class CouchDBExecutor:
                 'scanned': scanned,
                 'matched': 0,
                 'deleted': 0,
-                'errors': 0
+                'errors': 0,
+                'error_details': []
             }
 
         # Bulk delete
@@ -256,15 +449,14 @@ class CouchDBExecutor:
         if bulk_response.status_code not in (200, 201):
             raise ExecutorError(f"Bulk delete failed: {bulk_response.text}")
 
-        results = bulk_response.json()
-        deleted = sum(1 for r in results if r.get('ok'))
-        errors = sum(1 for r in results if 'error' in r)
+        ok_rows, error_details = _bulk_outcome(bulk_response.json())
 
         return {
             'scanned': scanned,
             'matched': len(to_delete),
-            'deleted': deleted,
-            'errors': errors
+            'deleted': len(ok_rows),
+            'errors': len(error_details),
+            'error_details': error_details
         }
 
     def execute_update(self, cmd: UpdateCommand) -> dict:
@@ -281,20 +473,13 @@ class CouchDBExecutor:
         elif db_response.status_code != 200:
             raise ExecutorError(f"Error accessing database: {db_response.text}")
 
-        # Fetch all documents
-        all_docs_response = self._request('GET', f'{database}/_all_docs', params={'include_docs': 'true'})
-        if all_docs_response.status_code != 200:
-            raise ExecutorError(f"Error fetching documents: {all_docs_response.text}")
-
-        all_docs = all_docs_response.json()
-        rows = all_docs.get('rows', [])
+        docs = self._fetch_all_docs(database)
 
         # Filter documents matching conditions and apply updates
         to_update = []
         scanned = 0
 
-        for row in rows:
-            doc = row.get('doc', {})
+        for doc in docs:
 
             # Skip design documents
             if doc.get('_id', '').startswith('_design/'):
@@ -303,10 +488,9 @@ class CouchDBExecutor:
             scanned += 1
 
             if self._matches_conditions(doc, cmd.conditions):
-                # Apply assignments to document
-                updated_doc = doc.copy()
+                updated_doc = copy.deepcopy(doc)
                 for field, value in cmd.assignments.items():
-                    updated_doc[field] = value
+                    self._assign_field(updated_doc, field, value)
                 to_update.append(updated_doc)
 
         if not to_update:
@@ -314,7 +498,8 @@ class CouchDBExecutor:
                 'scanned': scanned,
                 'matched': 0,
                 'updated': 0,
-                'errors': 0
+                'errors': 0,
+                'error_details': []
             }
 
         # Bulk update
@@ -322,15 +507,14 @@ class CouchDBExecutor:
         if bulk_response.status_code not in (200, 201):
             raise ExecutorError(f"Bulk update failed: {bulk_response.text}")
 
-        results = bulk_response.json()
-        updated = sum(1 for r in results if r.get('ok'))
-        errors = sum(1 for r in results if 'error' in r)
+        ok_rows, error_details = _bulk_outcome(bulk_response.json())
 
         return {
             'scanned': scanned,
             'matched': len(to_update),
-            'updated': updated,
-            'errors': errors
+            'updated': len(ok_rows),
+            'errors': len(error_details),
+            'error_details': error_details
         }
 
     def _analyze_fields(self, documents: list) -> dict:
@@ -417,7 +601,7 @@ class CouchDBExecutor:
                 # Convert complex types to JSON string for Excel
                 if isinstance(value, (dict, list)):
                     value = json.dumps(value, ensure_ascii=False)
-                ws.cell(row=row_idx, column=col_idx, value=value)
+                ws.cell(row=row_idx, column=col_idx, value=_excel_cell(value))
 
         wb.save(filename)
 
@@ -447,25 +631,31 @@ class CouchDBExecutor:
         fields = ['_id'] if '_id' in field_types else []
         fields += sorted([f for f in field_types.keys() if f not in ('_id', '_rev')])
 
+        quoted_table = _quote_sql_ident(table_name)
         with open(filename, 'w', encoding='utf-8') as f:
+            if not fields:
+                f.write("-- exported 0 documents\n")
+                return
+
             # Write CREATE TABLE statement
-            f.write(f"CREATE TABLE {table_name} (\n")
+            f.write(f"CREATE TABLE {quoted_table} (\n")
             field_defs = []
             for field in fields:
                 sql_type = field_types.get(field, 'TEXT')
+                quoted = _quote_sql_ident(field)
                 if field == '_id':
-                    field_defs.append(f"    {field} {sql_type} PRIMARY KEY")
+                    field_defs.append(f"    {quoted} {sql_type} PRIMARY KEY")
                 else:
-                    field_defs.append(f"    {field} {sql_type}")
+                    field_defs.append(f"    {quoted} {sql_type}")
             f.write(",\n".join(field_defs))
             f.write("\n);\n\n")
 
             # Write INSERT statements
             for doc in documents:
                 values = [self._escape_sql_value(doc.get(field)) for field in fields]
-                fields_str = ", ".join(fields)
+                fields_str = ", ".join(_quote_sql_ident(field) for field in fields)
                 values_str = ", ".join(values)
-                f.write(f"INSERT INTO {table_name} ({fields_str}) VALUES ({values_str});\n")
+                f.write(f"INSERT INTO {quoted_table} ({fields_str}) VALUES ({values_str});\n")
 
     def execute_export(self, cmd: ExportCommand) -> dict:
         """
@@ -481,20 +671,13 @@ class CouchDBExecutor:
         elif db_response.status_code != 200:
             raise ExecutorError(f"Error accessing database: {db_response.text}")
 
-        # Fetch all documents
-        all_docs_response = self._request('GET', f'{database}/_all_docs', params={'include_docs': 'true'})
-        if all_docs_response.status_code != 200:
-            raise ExecutorError(f"Error fetching documents: {all_docs_response.text}")
-
-        all_docs = all_docs_response.json()
-        rows = all_docs.get('rows', [])
+        docs = self._fetch_all_docs(database)
 
         # Filter documents matching conditions
         documents = []
         scanned = 0
 
-        for row in rows:
-            doc = row.get('doc', {})
+        for doc in docs:
 
             # Skip design documents
             if doc.get('_id', '').startswith('_design/'):
@@ -506,16 +689,8 @@ class CouchDBExecutor:
             if not cmd.conditions.items or self._matches_conditions(doc, cmd.conditions):
                 documents.append(doc)
 
-        if not documents:
-            return {
-                'scanned': scanned,
-                'matched': 0,
-                'exported': 0,
-                'filename': cmd.filename,
-                'format': cmd.format
-            }
-
-        # Analyze field types across all documents
+        # Analyze field types across all documents. An empty export still
+        # writes the file and reports fields: 0.
         field_types = self._analyze_fields(documents)
 
         # Export based on format
@@ -562,7 +737,7 @@ class CouchDBExecutor:
         # Check all rows to find max width for each column
         for row in rows:
             for field in fields:
-                value = self._format_cell_value(row.get(field))
+                value = self._format_cell_value(self._get_field_value(row, field))
                 col_widths[field] = max(col_widths[field], len(value))
 
         # Build the table
@@ -587,9 +762,9 @@ class CouchDBExecutor:
         for row in rows:
             cells = []
             for field in fields:
-                value = self._format_cell_value(row.get(field))
+                raw_value = self._get_field_value(row, field)
+                value = self._format_cell_value(raw_value)
                 # Right-align numbers, left-align everything else
-                raw_value = row.get(field)
                 if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
                     cells.append(f" {value.rjust(col_widths[field])} ")
                 else:
@@ -615,20 +790,13 @@ class CouchDBExecutor:
         elif db_response.status_code != 200:
             raise ExecutorError(f"Error accessing database: {db_response.text}")
 
-        # Fetch all documents
-        all_docs_response = self._request('GET', f'{database}/_all_docs', params={'include_docs': 'true'})
-        if all_docs_response.status_code != 200:
-            raise ExecutorError(f"Error fetching documents: {all_docs_response.text}")
-
-        all_docs = all_docs_response.json()
-        rows = all_docs.get('rows', [])
+        docs = self._fetch_all_docs(database)
 
         # Filter documents matching conditions
         documents = []
         scanned = 0
 
-        for row in rows:
-            doc = row.get('doc', {})
+        for doc in docs:
 
             # Skip design documents
             if doc.get('_id', '').startswith('_design/'):
@@ -646,24 +814,9 @@ class CouchDBExecutor:
             def sort_key(doc):
                 key_parts = []
                 for field, direction in cmd.order_by:
-                    value = doc.get(field)
-                    # None values sort last for ASC, first for DESC
-                    is_none = value is None
-                    if direction == 'DESC':
-                        # For DESC, we need to reverse the sort
-                        # None should come last in DESC (so is_none=True sorts after)
-                        if is_none:
-                            key_parts.append((True, None))
-                        elif isinstance(value, (int, float)):
-                            key_parts.append((False, -value))
-                        elif isinstance(value, str):
-                            # Reverse string comparison by inverting characters
-                            key_parts.append((False, tuple(-ord(c) for c in value)))
-                        else:
-                            key_parts.append((False, value))
-                    else:
-                        # ASC: None sorts last
-                        key_parts.append((is_none, value))
+                    value = self._get_field_value(doc, field)
+                    # None sorts last for both ASC and DESC.
+                    key_parts.append((value is None, _SortValue(value, direction == 'DESC')))
                 return tuple(key_parts)
 
             documents.sort(key=sort_key)
@@ -722,20 +875,13 @@ class CouchDBExecutor:
         elif db_response.status_code != 200:
             raise ExecutorError(f"Error accessing database: {db_response.text}")
 
-        # Fetch all documents
-        all_docs_response = self._request('GET', f'{database}/_all_docs', params={'include_docs': 'true'})
-        if all_docs_response.status_code != 200:
-            raise ExecutorError(f"Error fetching documents: {all_docs_response.text}")
-
-        all_docs = all_docs_response.json()
-        rows = all_docs.get('rows', [])
+        docs = self._fetch_all_docs(database)
 
         # Filter documents matching conditions
         matched_docs = []
         scanned = 0
 
-        for row in rows:
-            doc = row.get('doc', {})
+        for doc in docs:
 
             # Skip design documents
             if doc.get('_id', '').startswith('_design/'):
@@ -798,18 +944,14 @@ class CouchDBExecutor:
         if bulk_response.status_code not in (200, 201):
             raise ExecutorError(f"Bulk insert failed: {bulk_response.text}")
 
-        results = bulk_response.json()
-        inserted = sum(1 for r in results if r.get('ok'))
-        errors = sum(1 for r in results if 'error' in r)
-
-        # Collect generated IDs for inserted documents
-        inserted_ids = [r.get('id') for r in results if r.get('ok')]
+        ok_rows, error_details = _bulk_outcome(bulk_response.json())
 
         return {
             'total': len(docs),
-            'inserted': inserted,
-            'errors': errors,
-            'ids': inserted_ids
+            'inserted': len(ok_rows),
+            'errors': len(error_details),
+            'ids': [row.get('id') for row in ok_rows],
+            'error_details': error_details
         }
 
     def prepare_import(self, cmd: ImportCommand) -> dict:
@@ -842,9 +984,10 @@ class CouchDBExecutor:
         """Parse CSV file and prepare for import."""
         documents = []
         numeric_fields = []  # Fields ending with _NUM
+        bool_fields = []  # Fields ending with _BOOL
         final_field_names = {}  # Mapping from CSV header to final field name
 
-        with open(filename, 'r', encoding='utf-8') as f:
+        with open(filename, 'r', encoding='utf-8-sig', newline='') as f:
             reader = csv.reader(f)
 
             # Read header line
@@ -856,12 +999,15 @@ class CouchDBExecutor:
             if not headers:
                 raise ExecutorError("CSV file has no columns")
 
-            # Process headers - identify _NUM fields
+            # Process headers - identify _NUM and _BOOL fields
             for header in headers:
                 header = header.strip()
                 if header.endswith('_NUM'):
                     numeric_fields.append(header)
                     final_field_names[header] = header[:-4]  # Strip _NUM
+                elif header.endswith('_BOOL'):
+                    bool_fields.append(header)
+                    final_field_names[header] = header[:-5]
                 else:
                     final_field_names[header] = header
 
@@ -886,23 +1032,33 @@ class CouchDBExecutor:
                     final_name = final_field_names[header]
 
                     if header in numeric_fields:
-                        # Validate and convert numeric field
                         if value == '':
                             doc[final_name] = None
                         else:
                             try:
-                                if '.' in value:
-                                    doc[final_name] = float(value)
-                                else:
-                                    doc[final_name] = int(value)
+                                doc[final_name] = _parse_csv_number(value)
                             except ValueError:
                                 raise ExecutorError(
                                     f"Line {line_number}: Field '{header}' expects numeric value but got '{value}'\n"
                                     f"Content: {','.join(row)}"
                                 )
+                    elif header in bool_fields:
+                        if value == '':
+                            doc[final_name] = None
+                        else:
+                            parsed = _parse_csv_bool(value)
+                            if parsed is None:
+                                raise ExecutorError(
+                                    f"Line {line_number}: Field '{header}' expects true or false but got '{value}'\n"
+                                    f"Content: {','.join(row)}"
+                                )
+                            doc[final_name] = parsed
                     else:
-                        # String field
-                        doc[final_name] = value if value else None
+                        if value == '':
+                            doc[final_name] = None
+                        else:
+                            parsed = _parse_csv_bool(value)
+                            doc[final_name] = parsed if parsed is not None else value
 
                 documents.append(doc)
 
@@ -957,7 +1113,8 @@ class CouchDBExecutor:
             return {
                 'total': 0,
                 'inserted': 0,
-                'errors': 0
+                'errors': 0,
+                'error_details': []
             }
 
         # Remove _rev if present (from previous exports)
@@ -971,14 +1128,13 @@ class CouchDBExecutor:
         if bulk_response.status_code not in (200, 201):
             raise ExecutorError(f"Bulk insert failed: {bulk_response.text}")
 
-        results = bulk_response.json()
-        inserted = sum(1 for r in results if r.get('ok'))
-        errors = sum(1 for r in results if 'error' in r)
+        ok_rows, error_details = _bulk_outcome(bulk_response.json())
 
         return {
             'total': len(docs),
-            'inserted': inserted,
-            'errors': errors
+            'inserted': len(ok_rows),
+            'errors': len(error_details),
+            'error_details': error_details
         }
 
     def execute_create_database(self, cmd: CreateDatabaseCommand) -> dict:
@@ -1017,6 +1173,7 @@ class CouchDBExecutor:
 
     def execute(self, cmd) -> dict:
         """Execute a parsed command."""
+        self.type_warnings = []
         if isinstance(cmd, DeleteCommand):
             return self.execute_delete(cmd)
 
