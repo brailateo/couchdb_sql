@@ -20,6 +20,32 @@ class ExecutorError(Exception):
     pass
 
 
+def _values_equal(actual, expected) -> bool:
+    """Equality that keeps JSON booleans distinct from numbers.
+
+    In Python, True == 1 and False == 0. CouchDB documents store them
+    as different JSON types, so comparisons must not collapse them.
+    """
+    actual_bool = isinstance(actual, bool)
+    expected_bool = isinstance(expected, bool)
+    if actual_bool or expected_bool:
+        return actual_bool and expected_bool and actual == expected
+    return actual == expected
+
+
+def _same_order_kind(actual, expected) -> bool:
+    """False when a boolean is ordered against a non-boolean.
+
+    True < 2 is True in Python because bool is a subclass of int.
+    That would make `flag < 2` and `flag BETWEEN 0 AND 1` match JSON true.
+    """
+    actual_bool = isinstance(actual, bool)
+    expected_bool = isinstance(expected, bool)
+    if actual_bool or expected_bool:
+        return actual_bool and expected_bool
+    return True
+
+
 class CouchDBExecutor:
     def __init__(self):
         load_dotenv()
@@ -84,33 +110,45 @@ class CouchDBExecutor:
             return actual is None
         elif operator == 'IS NOT NULL':
             return actual is not None
+        # Null and missing fields fail every comparison, including
+        # `= null`. IS NULL / IS NOT NULL are handled above.
+        elif actual is None:
+            return False
 
         # Handle IN / NOT IN
         elif operator == 'IN':
-            return actual in expected
+            return any(_values_equal(actual, item) for item in expected)
         elif operator == 'NOT IN':
-            return actual not in expected
+            return all(not _values_equal(actual, item) for item in expected)
 
         # Handle BETWEEN
         elif operator == 'BETWEEN':
-            if actual is None:
-                return False
             low, high = expected
+            if not _same_order_kind(actual, low) or not _same_order_kind(actual, high):
+                return False
             return low <= actual <= high
 
         # Handle comparison operators
         elif operator == '=':
-            return actual == expected
+            return _values_equal(actual, expected)
         elif operator == '!=':
-            return actual != expected
+            return not _values_equal(actual, expected)
         elif operator == '<':
-            return actual is not None and actual < expected
+            if not _same_order_kind(actual, expected):
+                return False
+            return actual < expected
         elif operator == '>':
-            return actual is not None and actual > expected
+            if not _same_order_kind(actual, expected):
+                return False
+            return actual > expected
         elif operator == '<=':
-            return actual is not None and actual <= expected
+            if not _same_order_kind(actual, expected):
+                return False
+            return actual <= expected
         elif operator == '>=':
-            return actual is not None and actual >= expected
+            if not _same_order_kind(actual, expected):
+                return False
+            return actual >= expected
 
         # Handle regex operators
         elif operator == '~':
@@ -718,6 +756,10 @@ class CouchDBExecutor:
             distinct_values = set()
             for doc in matched_docs:
                 value = self._get_field_value(doc, cmd.distinct_field)
+                # bool is a subclass of int and would collapse with 1/0 in a set.
+                if isinstance(value, bool):
+                    distinct_values.add(('bool', value))
+                    continue
                 # Convert unhashable types to string for set membership
                 if isinstance(value, (dict, list)):
                     value = json.dumps(value, sort_keys=True)

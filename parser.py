@@ -217,13 +217,21 @@ def parse_single_condition(condition_str: str) -> Condition:
     if is_not_null_match:
         return Condition(field=is_not_null_match.group(1), operator='IS NOT NULL', value=None)
 
-    # Check for BETWEEN
-    between_match = re.match(r'^([\w.]+)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)\s*$', condition_str, re.IGNORECASE)
-    if between_match:
-        field = between_match.group(1)
-        low = tokenize_value(between_match.group(2))
-        high = tokenize_value(between_match.group(3))
-        return Condition(field=field, operator='BETWEEN', value=(low, high))
+    # Check for BETWEEN. The bounds' AND must be outside quotes so a
+    # bound can itself contain the word AND.
+    between_head = re.match(r'^([\w.]+)\s+BETWEEN\s+', condition_str, re.IGNORECASE)
+    if between_head:
+        rest = condition_str[between_head.end():]
+        and_at = _find_keyword_outside_quotes(rest, 'AND')
+        if and_at < 0:
+            raise ParseError(f"Invalid condition: {condition_str}")
+        low_text = rest[:and_at].strip()
+        high_text = rest[and_at + len('AND'):].strip()
+        if not low_text or not high_text:
+            raise ParseError(f"Invalid condition: {condition_str}")
+        low = tokenize_value(low_text)
+        high = tokenize_value(high_text)
+        return Condition(field=between_head.group(1), operator='BETWEEN', value=(low, high))
 
     # Check for IN
     in_match = re.match(r'^([\w.]+)\s+IN\s*(\(.+\))\s*$', condition_str, re.IGNORECASE)
@@ -252,6 +260,52 @@ def parse_single_condition(condition_str: str) -> Condition:
     value = tokenize_value(match.group(3))
 
     return Condition(field=field, operator=operator, value=value)
+
+
+def _skip_quoted_string(text: str, index: int):
+    """If text[index] opens a quote, return the index just after the closer.
+
+    Single quotes use PostgreSQL '' escapes. Returns None when text[index]
+    is not a quote. Raises ParseError when the closer is missing.
+    """
+    if index >= len(text) or text[index] not in ("'", '"'):
+        return None
+
+    quote = text[index]
+    i = index + 1
+    length = len(text)
+    while i < length:
+        if text[i] == quote:
+            if quote == "'" and i + 1 < length and text[i + 1] == "'":
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    raise ParseError("Unclosed quote")
+
+
+def _find_keyword_outside_quotes(text: str, keyword: str):
+    """Return the index of keyword outside quotes, or -1.
+
+    The keyword must be a whole word (not part of an identifier).
+    """
+    kw = keyword.upper()
+    klen = len(keyword)
+    i = 0
+    length = len(text)
+    while i < length:
+        closed = _skip_quoted_string(text, i)
+        if closed is not None:
+            i = closed
+            continue
+        if text[i:i + klen].upper() == kw:
+            before_ok = i == 0 or text[i - 1].isspace()
+            after = i + klen
+            after_ok = after == length or not (text[after].isalnum() or text[after] == '_')
+            if before_ok and after_ok:
+                return i
+        i += 1
+    return -1
 
 
 class WhereParser:
@@ -370,12 +424,19 @@ class WhereParser:
         self.skip_whitespace()
         start_pos = self.pos
 
-        # Find the end of this condition (before AND, OR, or closing paren)
+        # Find the end of this condition (before AND, OR, or closing paren).
+        # Quoted text is opaque: AND, OR, WHERE, and parentheses inside
+        # strings are literal, and a missing closer is an error.
         depth = 0
         end_pos = self.pos
         in_between = False  # Track if we've seen BETWEEN but not its AND yet
 
         while end_pos < self.length:
+            closed = _skip_quoted_string(self.original, end_pos)
+            if closed is not None:
+                end_pos = closed
+                continue
+
             char = self.original[end_pos]
 
             if char == '(':
@@ -530,15 +591,19 @@ def parse_update(sql: str) -> UpdateCommand:
     """Parse UPDATE command."""
     sql = sql.rstrip(';').strip()
 
-    pattern = r'^\s*UPDATE\s+(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+)\s*$'
-    match = re.match(pattern, sql, re.IGNORECASE)
-
-    if not match:
+    head = re.match(r'^\s*UPDATE\s+(\w+)\s+SET\s+', sql, re.IGNORECASE)
+    if not head:
         raise ParseError("Invalid UPDATE syntax. Expected: UPDATE <database> SET <field>=<value>,... WHERE <conditions>")
 
-    database = match.group(1)
-    set_clause = match.group(2)
-    where_clause = match.group(3)
+    database = head.group(1)
+    rest = sql[head.end():]
+    # Split on WHERE outside quotes so a string value can contain the word.
+    where_at = _find_keyword_outside_quotes(rest, 'WHERE')
+    if where_at < 0:
+        raise ParseError("Invalid UPDATE syntax. Expected: UPDATE <database> SET <field>=<value>,... WHERE <conditions>")
+
+    set_clause = rest[:where_at].strip()
+    where_clause = rest[where_at + len('WHERE'):].strip()
 
     assignments = parse_set_clause(set_clause)
     conditions = parse_where_clause(where_clause)

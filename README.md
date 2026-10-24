@@ -461,6 +461,15 @@ WHERE message = 'It''s a "great" day'
 - `python-dotenv` - Environment variable management
 - `openpyxl` - Excel file support (optional, for EXPORT to .xlsx)
 
+## Tests
+
+Regression tests use pytest and a fake CouchDB HTTP layer (no server):
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## License
 
 MIT License
