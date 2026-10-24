@@ -278,7 +278,7 @@ IMPORT <filename> INTO <database>
 - `.csv` - CSV with header row
 - `.json` - JSON array of documents
 
-**CSV numeric convention:** Fields ending with `_NUM` are converted to numbers (suffix stripped).
+**CSV numeric convention:** Fields ending with `_NUM` are converted to numbers (suffix stripped). Scientific notation such as `1e2` becomes `100`. A value with a leading zero such as `012` stays text. Cells whose entire value is `true` or `false` (and fields ending with `_BOOL`) become booleans. A UTF-8 BOM on the header row is ignored.
 
 **Examples:**
 

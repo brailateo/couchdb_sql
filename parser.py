@@ -209,17 +209,17 @@ def parse_single_condition(condition_str: str) -> Condition:
     condition_str = condition_str.strip()
 
     # Check for IS NULL / IS NOT NULL
-    is_null_match = re.match(r'^([\w.]+)\s+IS\s+NULL\s*$', condition_str, re.IGNORECASE)
+    is_null_match = re.match(r'^([\w.\-]+)\s+IS\s+NULL\s*$', condition_str, re.IGNORECASE)
     if is_null_match:
         return Condition(field=is_null_match.group(1), operator='IS NULL', value=None)
 
-    is_not_null_match = re.match(r'^([\w.]+)\s+IS\s+NOT\s+NULL\s*$', condition_str, re.IGNORECASE)
+    is_not_null_match = re.match(r'^([\w.\-]+)\s+IS\s+NOT\s+NULL\s*$', condition_str, re.IGNORECASE)
     if is_not_null_match:
         return Condition(field=is_not_null_match.group(1), operator='IS NOT NULL', value=None)
 
     # Check for BETWEEN. The bounds' AND must be outside quotes so a
     # bound can itself contain the word AND.
-    between_head = re.match(r'^([\w.]+)\s+BETWEEN\s+', condition_str, re.IGNORECASE)
+    between_head = re.match(r'^([\w.\-]+)\s+BETWEEN\s+', condition_str, re.IGNORECASE)
     if between_head:
         rest = condition_str[between_head.end():]
         and_at = _find_keyword_outside_quotes(rest, 'AND')
@@ -234,14 +234,14 @@ def parse_single_condition(condition_str: str) -> Condition:
         return Condition(field=between_head.group(1), operator='BETWEEN', value=(low, high))
 
     # Check for IN
-    in_match = re.match(r'^([\w.]+)\s+IN\s*(\(.+\))\s*$', condition_str, re.IGNORECASE)
+    in_match = re.match(r'^([\w.\-]+)\s+IN\s*(\(.+\))\s*$', condition_str, re.IGNORECASE)
     if in_match:
         field = in_match.group(1)
         values = parse_in_values(in_match.group(2))
         return Condition(field=field, operator='IN', value=values)
 
     # Check for NOT IN
-    not_in_match = re.match(r'^([\w.]+)\s+NOT\s+IN\s*(\(.+\))\s*$', condition_str, re.IGNORECASE)
+    not_in_match = re.match(r'^([\w.\-]+)\s+NOT\s+IN\s*(\(.+\))\s*$', condition_str, re.IGNORECASE)
     if not_in_match:
         field = not_in_match.group(1)
         values = parse_in_values(not_in_match.group(2))
@@ -249,7 +249,7 @@ def parse_single_condition(condition_str: str) -> Condition:
 
     # Standard comparison operators (including regex)
     # Field names can include dots for nested access
-    pattern = r'^\s*([\w.]+)\s*(~\*|~|!=|<=|>=|=|<|>)\s*(.+?)\s*$'
+    pattern = r'^\s*([\w.\-]+)\s*(~\*|~|!=|<=|>=|=|<|>)\s*(.+?)\s*$'
     match = re.match(pattern, condition_str)
 
     if not match:
@@ -489,7 +489,7 @@ def parse_where_clause(where_str: str) -> ConditionGroup:
 
 def parse_delete(sql: str) -> DeleteCommand:
     """Parse DELETE command."""
-    pattern = r'^\s*DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?\s*$'
+    pattern = r'^\s*DELETE\s+FROM\s+([\w$()+-]+)(?:\s+WHERE\s+(.+))?\s*$'
     match = re.match(pattern, sql.rstrip(';'), re.IGNORECASE)
 
     if not match:
@@ -526,7 +526,7 @@ def parse_set_clause(set_str: str) -> dict:
 
         # Parse field name
         field_start = i
-        while i < len(set_str) and (set_str[i].isalnum() or set_str[i] in '_.'):
+        while i < len(set_str) and (set_str[i].isalnum() or set_str[i] in '_.-'):
             i += 1
         field = set_str[field_start:i].strip()
 
@@ -591,7 +591,7 @@ def parse_update(sql: str) -> UpdateCommand:
     """Parse UPDATE command."""
     sql = sql.rstrip(';').strip()
 
-    head = re.match(r'^\s*UPDATE\s+(\w+)\s+SET\s+', sql, re.IGNORECASE)
+    head = re.match(r'^\s*UPDATE\s+([\w$()+-]+)\s+SET\s+', sql, re.IGNORECASE)
     if not head:
         raise ParseError("Invalid UPDATE syntax. Expected: UPDATE <database> SET <field>=<value>,... WHERE <conditions>")
 
@@ -621,7 +621,7 @@ def parse_export(sql: str) -> ExportCommand:
     """Parse EXPORT command."""
     sql = sql.rstrip(';').strip()
 
-    pattern = r'^\s*EXPORT\s+(\w+)\s+TO\s+([^\s]+)(?:\s+WHERE\s+(.+))?\s*$'
+    pattern = r'^\s*EXPORT\s+([\w$()+-]+)\s+TO\s+([^\s]+)(?:\s+WHERE\s+(.+))?\s*$'
     match = re.match(pattern, sql, re.IGNORECASE)
 
     if not match:
@@ -679,7 +679,7 @@ def parse_select(sql: str) -> Union[SelectCommand, CountCommand]:
     sql = sql.rstrip(';').strip()
 
     # Check for SELECT COUNT(DISTINCT field) FROM ...
-    count_distinct_pattern = r'^\s*SELECT\s+COUNT\s*\(\s*DISTINCT\s+([\w.]+)\s*\)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?\s*$'
+    count_distinct_pattern = r'^\s*SELECT\s+COUNT\s*\(\s*DISTINCT\s+([\w.\-]+)\s*\)\s+FROM\s+([\w$()+-]+)(?:\s+WHERE\s+(.+))?\s*$'
     match = re.match(count_distinct_pattern, sql, re.IGNORECASE)
     if match:
         distinct_field = match.group(1)
@@ -689,7 +689,7 @@ def parse_select(sql: str) -> Union[SelectCommand, CountCommand]:
         return CountCommand(database=database, conditions=conditions, distinct_field=distinct_field)
 
     # Check for SELECT COUNT(*) FROM ...
-    count_all_pattern = r'^\s*SELECT\s+COUNT\s*\(\s*\*\s*\)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?\s*$'
+    count_all_pattern = r'^\s*SELECT\s+COUNT\s*\(\s*\*\s*\)\s+FROM\s+([\w$()+-]+)(?:\s+WHERE\s+(.+))?\s*$'
     match = re.match(count_all_pattern, sql, re.IGNORECASE)
     if match:
         database = match.group(1)
@@ -697,8 +697,18 @@ def parse_select(sql: str) -> Union[SelectCommand, CountCommand]:
         conditions = parse_where_clause(where_clause)
         return CountCommand(database=database, conditions=conditions, distinct_field=None)
 
+    # SELECT COUNT that did not match the forms above (for example COUNT(*) ... LIMIT)
+    # must not fall through to a normal SELECT of a column named COUNT(*).
+    if re.match(r'^\s*SELECT\s+COUNT\b', sql, re.IGNORECASE):
+        raise ParseError(
+            "Invalid SELECT COUNT syntax. Expected: "
+            "SELECT COUNT(*) FROM <database> [WHERE <conditions>] or "
+            "SELECT COUNT(DISTINCT <field>) FROM <database> [WHERE <conditions>]. "
+            "ORDER BY, LIMIT, and OFFSET are not supported on COUNT."
+        )
+
     # Standard SELECT
-    pattern = r'^\s*SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+?))?(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?\s*$'
+    pattern = r'^\s*SELECT\s+(.+?)\s+FROM\s+([\w$()+-]+)(?:\s+WHERE\s+(.+?))?(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?\s*$'
     match = re.match(pattern, sql, re.IGNORECASE)
 
     if not match:
@@ -736,7 +746,7 @@ def parse_count(sql: str) -> CountCommand:
     sql = sql.rstrip(';').strip()
 
     # Try COUNT DISTINCT first
-    distinct_pattern = r'^\s*COUNT\s+DISTINCT\s+([\w.]+)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?\s*$'
+    distinct_pattern = r'^\s*COUNT\s+DISTINCT\s+([\w.\-]+)\s+FROM\s+([\w$()+-]+)(?:\s+WHERE\s+(.+))?\s*$'
     match = re.match(distinct_pattern, sql, re.IGNORECASE)
 
     if match:
@@ -747,7 +757,7 @@ def parse_count(sql: str) -> CountCommand:
         return CountCommand(database=database, conditions=conditions, distinct_field=distinct_field)
 
     # Try COUNT *
-    count_all_pattern = r'^\s*COUNT\s+\*\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+))?\s*$'
+    count_all_pattern = r'^\s*COUNT\s+\*\s+FROM\s+([\w$()+-]+)(?:\s+WHERE\s+(.+))?\s*$'
     match = re.match(count_all_pattern, sql, re.IGNORECASE)
 
     if match:
@@ -819,7 +829,7 @@ def parse_insert(sql: str) -> InsertCommand:
     sql = sql.rstrip(';').strip()
 
     # Match: INSERT INTO <database> (fields) VALUES ...
-    pattern = r'^\s*INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*(.+)\s*$'
+    pattern = r'^\s*INSERT\s+INTO\s+([\w$()+-]+)\s*\(([^)]+)\)\s*VALUES\s*(.+)\s*$'
     match = re.match(pattern, sql, re.IGNORECASE)
 
     if not match:
@@ -902,12 +912,12 @@ def parse_import(sql: str) -> ImportCommand:
     sql = sql.rstrip(';').strip()
 
     # Try quoted filename first
-    pattern_quoted = r'^\s*IMPORT\s+["\']([^"\']+)["\']\s+INTO\s+(\w+)\s*$'
+    pattern_quoted = r'^\s*IMPORT\s+["\']([^"\']+)["\']\s+INTO\s+([\w$()+-]+)\s*$'
     match = re.match(pattern_quoted, sql, re.IGNORECASE)
 
     if not match:
         # Try unquoted filename
-        pattern = r'^\s*IMPORT\s+([^\s]+)\s+INTO\s+(\w+)\s*$'
+        pattern = r'^\s*IMPORT\s+([^\s]+)\s+INTO\s+([\w$()+-]+)\s*$'
         match = re.match(pattern, sql, re.IGNORECASE)
 
     if not match:
@@ -935,7 +945,7 @@ def parse_create(sql: str) -> CreateDatabaseCommand:
     """
     sql = sql.rstrip(';').strip()
 
-    pattern = r'^\s*CREATE\s+(\w+)\s*$'
+    pattern = r'^\s*CREATE\s+([\w$()+-]+)\s*$'
     match = re.match(pattern, sql, re.IGNORECASE)
 
     if not match:
