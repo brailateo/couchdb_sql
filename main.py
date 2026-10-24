@@ -10,9 +10,11 @@ import json
 from parser import parse, ParseError, ImportCommand
 from executor import CouchDBExecutor, ExecutorError
 
+__version__ = "0.2.0"
+
 
 class CouchDBSQL(cmd.Cmd):
-    intro = """CouchDB SQL Interface
+    intro = f"""CouchDB SQL Interface {__version__}
 Type SQL-like commands or 'help' for assistance.
 Type 'quit' or 'exit' to leave.
 
@@ -334,6 +336,9 @@ Multi-line input:
 
 
 def main():
+    if sys.argv[1:] == ["--version"]:
+        print(f"couchdb_sql {__version__}")
+        return
     try:
         CouchDBSQL().cmdloop()
     except KeyboardInterrupt:

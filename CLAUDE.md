@@ -2,7 +2,7 @@
 
 A SQL-like command-line interface for CouchDB operations.
 
-**Version:** 1.0.0
+**Version:** 0.2.0 (`__version__` in `main.py`)
 **Repository:** https://github.com/brailateo/couchdb_sql
 
 ## Overview
